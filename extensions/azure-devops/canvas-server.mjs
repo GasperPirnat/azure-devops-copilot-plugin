@@ -658,6 +658,28 @@ async function requestMicrosoftToken(params) {
     return data;
 }
 
+async function readLimitedText(response, limit) {
+    const reader = response.body?.getReader();
+    if (!reader) return "";
+    const chunks = [];
+    let size = 0;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            size += value.byteLength;
+            if (size > limit) {
+                await reader.cancel();
+                throw new CanvasError("azure_devops_diff_too_large", "File is too large for the inline diff.");
+            }
+            chunks.push(Buffer.from(value));
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    return Buffer.concat(chunks).toString("utf8");
+}
+
 async function getBrowserOAuthAccessToken() {
     const cache = browserTokenCache;
     if (!cache) {
@@ -1061,7 +1083,9 @@ async function fetchJson(config, path, options = {}) {
         headers: await makeAuthHeaders(options.headers),
         body: options.body,
     });
-    const text = await response.text();
+    const text = options.maxResponseBytes
+        ? await readLimitedText(response, options.maxResponseBytes)
+        : await response.text();
     let data = {};
     if (text) {
         try {
@@ -1697,6 +1721,129 @@ async function getRepositoryFileContent(config, project, repositoryId, filePath,
         },
     );
     return typeof data.content === "string" ? data.content : "";
+}
+
+const FILE_DIFF_MAX_BYTES = 1024 * 1024;
+const FILE_DIFF_MAX_LINES = 12000;
+
+// Keep line endings in the comparison tokens: a missing final newline must be
+// visible, and an empty file has zero lines rather than one invented blank line.
+function fileDiffLines(content) {
+    return content.match(/[^\n]*\n|[^\n]+$/g) || [];
+}
+
+function buildPullRequestFileDiff(targetContent, sourceContent) {
+    if ([targetContent, sourceContent].some((text) => Buffer.byteLength(text, "utf8") > FILE_DIFF_MAX_BYTES)) {
+        return { unavailable: "File is too large for the inline diff (1 MiB per version)." };
+    }
+    if ([targetContent, sourceContent].some((text) => text.includes("\0"))) {
+        return { unavailable: "Binary files cannot be displayed as a text diff." };
+    }
+    const target = fileDiffLines(targetContent);
+    const source = fileDiffLines(sourceContent);
+    if (target.length + source.length > FILE_DIFF_MAX_LINES) {
+        return { unavailable: "File has too many lines for the inline diff (12,000 combined)." };
+    }
+    let rows = myersLineDiff(target, source);
+    const simplified = !rows;
+    if (!rows) {
+        // The comment diff's bounded Myers search can stop at 400 edits. A full
+        // file must never inherit its snippet fallback, which omits changes.
+        let prefix = 0;
+        let suffix = 0;
+        while (prefix < Math.min(target.length, source.length) && target[prefix] === source[prefix]) prefix++;
+        while (suffix < Math.min(target.length, source.length) - prefix && target.at(-suffix - 1) === source.at(-suffix - 1)) suffix++;
+        rows = [
+            ...target.slice(0, prefix).map((text, i) => ({ type: "context", text, targetLineNumber: i + 1, sourceLineNumber: i + 1 })),
+            ...target.slice(prefix, target.length - suffix).map((text, i) => ({ type: "deletion", text, targetLineNumber: prefix + i + 1 })),
+            ...source.slice(prefix, source.length - suffix).map((text, i) => ({ type: "addition", text, sourceLineNumber: prefix + i + 1 })),
+            ...target.slice(target.length - suffix).map((text, i) => ({ type: "context", text, targetLineNumber: target.length - suffix + i + 1, sourceLineNumber: source.length - suffix + i + 1 })),
+        ];
+    }
+    return {
+        rows: rows.map((row) => ({ ...row, text: row.text.replace(/\r?\n$/, ""), noNewline: !row.text.endsWith("\n") })),
+        additions: rows.filter((row) => row.type === "addition").length,
+        deletions: rows.filter((row) => row.type === "deletion").length,
+        simplified,
+    };
+}
+
+async function pullRequestChangeSnapshot(overrides) {
+    const context = await resolvePullRequestContext(overrides);
+    const { config, project, repositoryId, reference } = context;
+    const iterations = await getPullRequestIterations(config, project, repositoryId, reference.id);
+    const requested = Number(overrides.iterationId);
+    const iteration = requested
+        ? iterations.find((item) => Number(item.id) === requested)
+        : iterations.reduce((latest, item) => Number(item.id) > Number(latest?.id || 0) ? item : latest, null);
+    if (!iteration?.commonRefCommit?.commitId || !iteration?.sourceRefCommit?.commitId) {
+        throw new CanvasError("azure_devops_diff_snapshot_missing", "The PR comparison commits are unavailable. Refresh the pull request or open it in Azure DevOps.");
+    }
+    const changes = await getPullRequestIterationChanges(config, project, repositoryId, reference.id, iteration.id, 0);
+    return { ...context, iteration, changes: changes.filter((change) => !change.item?.isFolder && change.item?.path) };
+}
+
+function mapPullRequestFile(change) {
+    return {
+        changeTrackingId: Number(change.changeTrackingId),
+        path: change.item.path,
+        originalPath: change.originalPath || change.item.path,
+        changeType: change.changeType || "edit",
+    };
+}
+
+async function getPullRequestChanges(overrides = {}) {
+    const { iteration, changes } = await pullRequestChangeSnapshot(overrides);
+    return {
+        iterationId: Number(iteration.id),
+        baseCommit: iteration.commonRefCommit.commitId,
+        sourceCommit: iteration.sourceRefCommit.commitId,
+        files: changes.map(mapPullRequestFile),
+    };
+}
+
+async function getDiffFileContent(config, project, repositoryId, path, commit) {
+    const data = await fetchJson(config,
+        `${encodeURIComponent(project)}/_apis/git/repositories/${encodeURIComponent(repositoryId)}/items`, {
+            apiVersion: "7.1",
+            // JSON can expand each content byte into a six-byte escape.
+            maxResponseBytes: FILE_DIFF_MAX_BYTES * 6 + 65536,
+            params: { path, includeContent: true, includeContentMetadata: true, "$format": "json",
+                "versionDescriptor.version": commit, "versionDescriptor.versionType": "commit" },
+        });
+    if (data.contentMetadata?.isBinary) return { unavailable: "Binary files cannot be displayed as a text diff." };
+    if (typeof data.content !== "string") return { unavailable: "Azure DevOps did not return text content for this file." };
+    return { content: data.content };
+}
+
+async function getPullRequestFileDiff(overrides = {}) {
+    if (!(Number(overrides.iterationId) > 0)) {
+        throw new CanvasError("azure_devops_diff_iteration_required", "Choose a PR iteration before loading a file diff.");
+    }
+    const snapshot = await pullRequestChangeSnapshot(overrides);
+    const { config, project, repositoryId, current, iteration, changes } = snapshot;
+    const change = changes.find((item) => Number(item.changeTrackingId) === Number(overrides.changeTrackingId));
+    if (!change) throw new CanvasError("azure_devops_diff_file_missing", "This file is not part of the selected PR comparison.");
+    const file = mapPullRequestFile(change);
+    if (change.item.gitObjectType && change.item.gitObjectType !== "blob") {
+        return { ...file, unavailable: "This Git object cannot be displayed as a text diff." };
+    }
+    const types = String(change.changeType).toLowerCase().split(/[,\s]+/);
+    const fork = current.forkSource?.repository;
+    try {
+        const [oldFile, newFile] = await Promise.all([
+            types.includes("add") ? { content: "" } : getDiffFileContent(config, project, repositoryId, file.originalPath, iteration.commonRefCommit.commitId),
+            types.includes("delete") ? { content: "" } : getDiffFileContent(config, fork?.project?.id || fork?.project?.name || project,
+                fork?.id || repositoryId, file.path, iteration.sourceRefCommit.commitId),
+        ]);
+        return { ...file, ...(oldFile.unavailable || newFile.unavailable
+            ? { unavailable: oldFile.unavailable || newFile.unavailable }
+            : buildPullRequestFileDiff(oldFile.content, newFile.content)) };
+    } catch (error) {
+        if (error.code === "azure_devops_diff_too_large") return { ...file, unavailable: error.message };
+        // A missing file on an existing side is an error, never an empty file.
+        throw error;
+    }
 }
 
 function threadCodeLocation(thread) {
@@ -4243,6 +4390,22 @@ async function handleApi(entry, req, res, url) {
             }));
             return;
         }
+        const changesRoute = url.pathname.match(/^\/api\/pull-requests\/(\d+)\/changes(?:\/(\d+))?$/);
+        if (req.method === "GET" && changesRoute) {
+            const connection = await requireConnection(entry.input, connectionSelector(url));
+            const overrides = {
+                ...entry.input,
+                id: Number(changesRoute[1]),
+                pullRequestId: Number(changesRoute[1]),
+                pullRequestUrl: "",
+                ...connectionOverrides(connection),
+                repositoryId: "",
+                iterationId: url.searchParams.get("iterationId"),
+                changeTrackingId: changesRoute[2],
+            };
+            jsonResponse(res, 200, await (changesRoute[2] ? getPullRequestFileDiff(overrides) : getPullRequestChanges(overrides)));
+            return;
+        }
         if (req.method === "PATCH" && /^\/api\/pull-requests\/\d+$/.test(url.pathname)) {
             const id = Number(url.pathname.split("/").pop());
             const body = await readRequestBody(req);
@@ -4476,6 +4639,9 @@ export {
     addWorkItemComment,
     buildCommentFixPrompt,
     buildThreadDiff,
+    buildPullRequestFileDiff,
+    getPullRequestChanges,
+    getPullRequestFileDiff,
     canvasTitle,
     clearDefaultConnection,
     completePullRequest,

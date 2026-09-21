@@ -10,6 +10,7 @@ The Azure DevOps Copilot Plugin brings your Azure DevOps work into the [GitHub C
 - See **My Work** across Azure DevOps.
 - Browse and update work items.
 - Review and manage pull requests.
+- Inspect remote pull request files with lazy-loaded side-by-side or unified diffs, file filtering, and expandable unchanged lines. See [PR diff implementation and setup](PR_DIFF.md).
 - Connect pull requests and work items.
 - Work through an interactive Azure DevOps canvas in the GitHub Copilot App.
 

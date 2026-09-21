@@ -840,6 +840,10 @@ function profileImageUrl(imageUrl) {
 function renderPullRequestTab(tab) {
     tab.replyDrafts ||= {};
     renderPullRequest(tab.content, tab.data, {
+        loadChanges: () => request(`/api/pull-requests/${tab.data.id}/changes${connectionQuery(tab.entry)}`),
+        loadFileDiff: (iterationId, changeTrackingId) => request(
+            `/api/pull-requests/${tab.data.id}/changes/${changeTrackingId}${connectionQuery(tab.entry, { iterationId })}`,
+        ),
         avatarUrl: profileImageUrl,
         timelineFilter: tab.timelineFilter,
         canEdit: canEditPullRequest(tab.data),

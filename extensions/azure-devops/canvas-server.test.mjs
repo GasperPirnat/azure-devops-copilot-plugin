@@ -66,7 +66,12 @@ async function loadCanvasServer({ execFileImpl, existsSyncImpl, readdirSyncImpl,
     const initializeImportMeta = (meta, module) => { meta.url = module.identifier; };
     const loadRelative = async (href) => {
         if (cache.has(href)) return cache.get(href);
-        const mod = new SourceTextModule(await readFile(new URL(href), "utf8"), { context, identifier: href, initializeImportMeta });
+        // This suite supplies a fake AzureAuth installation and token. The
+        // marketplace disables Agency auth; enable only that flag in this VM
+        // so tests remain offline and independent of distribution packaging.
+        let source = await readFile(new URL(href), "utf8");
+        if (href.endsWith("/ui/feature-flags.mjs")) source = source.replace("AGENCY_AUTH_ENABLED = false", "AGENCY_AUTH_ENABLED = true");
+        const mod = new SourceTextModule(source, { context, identifier: href, initializeImportMeta });
         cache.set(href, mod);
         await mod.link(linker);
         return mod;
@@ -2243,6 +2248,7 @@ function azureDevOpsStub({
     workItemSearchIds,
     workItemSearchItems,
     completionPollsBeforeCompleted = 0,
+    diffFixture,
 } = {}) {
     const requests = [];
     const current = {
@@ -2282,6 +2288,20 @@ function azureDevOpsStub({
         });
         if (path.endsWith("/_apis/connectionData")) {
             return json({ authenticatedUser: { id: "me", displayName: "Me" } });
+        }
+        if (diffFixture && path.endsWith("/iterations")) return json({ value: diffFixture.iterations });
+        if (diffFixture && /\/iterations\/\d+\/changes$/.test(path)) {
+            assert.equal(parsedUrl.searchParams.get("$compareTo"), "0");
+            const skip = Number(parsedUrl.searchParams.get("$skip"));
+            return json({ changeEntries: diffFixture.changes.slice(skip, skip + 2),
+                nextSkip: skip + 2, nextTop: skip + 2 < diffFixture.changes.length ? 2 : 0 });
+        }
+        if (diffFixture && path.endsWith("/items")) {
+            assert.equal(parsedUrl.searchParams.get("versionDescriptor.versionType"), "commit");
+            const key = `${parsedUrl.searchParams.get("versionDescriptor.version")}:${parsedUrl.searchParams.get("path")}`;
+            const item = diffFixture.contents[key];
+            if (item === undefined) return new Response(JSON.stringify({ message: "File not found" }), { status: 404 });
+            return json(typeof item === "string" ? { content: item } : item);
         }
         if (/\/_apis\/git\/pullrequests\/\d+$/.test(path) && method === "GET") {
             if (pendingCompletionPolls > 0) {
@@ -2380,6 +2400,146 @@ const pullRequestReference = { organization: "fabrikam", project: "project", pul
 // canvas-server.mjs runs in its own vm realm, so the objects it returns do not
 // share this realm's prototypes and compare unequal structurally-identical.
 const plain = (value) => JSON.parse(JSON.stringify(value));
+
+function prDiffFixture() {
+    return {
+        // Deliberately unsorted: select by id, not array position.
+        iterations: [
+            { id: 3, commonRefCommit: { commitId: "base3" }, sourceRefCommit: { commitId: "source3" }, targetRefCommit: { commitId: "target3" } },
+            { id: 1, commonRefCommit: { commitId: "base1" }, sourceRefCommit: { commitId: "source1" } },
+        ],
+        changes: [
+            { changeTrackingId: 1, changeType: "edit", item: { path: "/edit.txt", gitObjectType: "blob" } },
+            { changeTrackingId: 2, changeType: "add", item: { path: "/new.txt" } },
+            { changeTrackingId: 3, changeType: "delete", item: { path: "/gone.txt" } },
+            { changeTrackingId: 4, changeType: "rename, edit", originalPath: "/old.txt", item: { path: "/renamed.txt" } },
+            { changeTrackingId: 5, changeType: "edit", item: { path: "/image.png" } },
+            { changeTrackingId: 6, changeType: "add", item: { path: "/folder", isFolder: true } },
+        ],
+        contents: {
+            "base3:/edit.txt": "same\nold\n", "source3:/edit.txt": "same\nnew\n",
+            "source3:/new.txt": "created\n", "base3:/gone.txt": "removed\n",
+            "base3:/old.txt": "before\n", "source3:/renamed.txt": "after\n",
+            "base3:/image.png": { contentMetadata: { isBinary: true } },
+            "source3:/image.png": { contentMetadata: { isBinary: true } },
+        },
+    };
+}
+
+test("PR files paginate all changes without loading contents and pin the common base", async (t) => {
+    const fixture = prDiffFixture();
+    const { namespace, ado } = await loadWithAzureDevOps({ diffFixture: fixture });
+    const canvas = await startCanvas(namespace);
+    t.after(() => canvas.close());
+    await waitForAuthProcess(canvas);
+    const snapshot = await namespace.getPullRequestChanges(pullRequestReference);
+    assert.equal(snapshot.iterationId, 3);
+    assert.equal(snapshot.baseCommit, "base3");
+    assert.equal(snapshot.files.length, 5);
+    assert.equal(ado.requests.filter((r) => r.path.endsWith("/changes")).length, 3);
+    assert.equal(ado.requests.some((r) => r.path.endsWith("/items")), false);
+    fixture.iterations.push({ id: 4, commonRefCommit: { commitId: "base4" }, sourceRefCommit: { commitId: "source4" } });
+    const diff = await namespace.getPullRequestFileDiff({ ...pullRequestReference, iterationId: snapshot.iterationId, changeTrackingId: 1 });
+    assert.deepEqual(plain(diff.rows).map((r) => [r.type, r.text]), [["context", "same"], ["deletion", "old"], ["addition", "new"]]);
+    const versions = ado.requests.filter((r) => r.path.endsWith("/items")).map((r) => new URLSearchParams(r.search).get("versionDescriptor.version"));
+    assert.deepEqual(versions.sort(), ["base3", "source3"]);
+});
+
+test("PR files handle additions, deletions, renames, binaries and missing content without inventing changes", async (t) => {
+    const fixture = prDiffFixture();
+    const { namespace } = await loadWithAzureDevOps({ diffFixture: fixture });
+    const canvas = await startCanvas(namespace);
+    t.after(() => canvas.close());
+    await waitForAuthProcess(canvas);
+    const read = (changeTrackingId) => namespace.getPullRequestFileDiff({ ...pullRequestReference, iterationId: 3, changeTrackingId });
+    assert.equal((await read(2)).additions, 1);
+    assert.equal((await read(3)).deletions, 1);
+    const rename = await read(4);
+    assert.equal(rename.originalPath, "/old.txt");
+    assert.equal(rename.rows[0].text, "before");
+    assert.equal(rename.rows[1].text, "after");
+    assert.match((await read(5)).unavailable, /Binary/);
+    delete fixture.contents["base3:/edit.txt"];
+    await assert.rejects(read(1), /404/);
+    await assert.rejects(read(99), /not part/);
+    await assert.rejects(namespace.getPullRequestFileDiff({ ...pullRequestReference, changeTrackingId: 1 }), /iteration/);
+    fixture.iterations[0].commonRefCommit = null;
+    await assert.rejects(read(1), /comparison commits/);
+});
+
+test("PR files read a fork's source commit from the fork repository", async (t) => {
+    const { namespace, ado } = await loadWithAzureDevOps({ diffFixture: prDiffFixture(),
+        pullRequest: { forkSource: { repository: { id: "fork-repo", project: { name: "fork-project" } } } } });
+    const canvas = await startCanvas(namespace);
+    t.after(() => canvas.close());
+    await waitForAuthProcess(canvas);
+    await namespace.getPullRequestFileDiff({ ...pullRequestReference, iterationId: 3, changeTrackingId: 1 });
+    const items = ado.requests.filter((r) => r.path.endsWith("/items"));
+    assert.ok(items.some((r) => r.path.includes("/fork-project/_apis/git/repositories/fork-repo/")));
+    assert.ok(items.some((r) => r.path.includes("/project/_apis/git/repositories/repo-guid/")));
+});
+
+test("full file diffs preserve empty files, final newlines, line numbers and large replacements", async () => {
+    const { namespace } = await loadWithAzureDevOps();
+    const diff = (left, right) => plain(namespace.buildPullRequestFileDiff(left, right));
+    assert.deepEqual(diff("", "").rows, []);
+    assert.equal(diff("", "\n").additions, 1);
+    const newline = diff("hello", "hello\n");
+    assert.equal(newline.deletions, 1);
+    assert.equal(newline.rows[0].noNewline, true);
+    assert.equal(newline.rows[1].noNewline, false);
+    const large = diff("start\n" + "old\n".repeat(500) + "end\n", "start\n" + "new\n".repeat(500) + "end\n");
+    assert.equal(large.simplified, true);
+    assert.equal(large.additions, 500);
+    assert.equal(large.deletions, 500);
+    assert.equal(large.rows.at(-1).sourceLineNumber, 502);
+    assert.match(diff("", "x".repeat(1024 * 1024 + 1)).unavailable, /large/);
+    assert.match(diff("", "\n".repeat(12001)).unavailable, /lines/);
+    assert.match(diff("", "\0").unavailable, /Binary/);
+    // Every row sequence reconstructs both input files, even repeated lines.
+    let seed = 42;
+    const random = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+    for (let i = 0; i < 100; i++) {
+        const make = () => Array.from({ length: Math.floor(random() * 30) }, () => `${Math.floor(random() * 5)}\n`).join("");
+        const left = make();
+        const right = make();
+        const result = diff(left, right);
+        const reconstruct = (excluded) => result.rows.filter((r) => r.type !== excluded).map((r) => r.text + (r.noNewline ? "" : "\n")).join("");
+        assert.equal(reconstruct("addition"), left);
+        assert.equal(reconstruct("deletion"), right);
+    }
+});
+
+test("PR file content responses enforce the byte limit while streaming", async (t) => {
+    const fixture = prDiffFixture();
+    fixture.contents["source3:/new.txt"] = "x".repeat(7 * 1024 * 1024);
+    const { namespace } = await loadWithAzureDevOps({ diffFixture: fixture });
+    const canvas = await startCanvas(namespace);
+    t.after(() => canvas.close());
+    await waitForAuthProcess(canvas);
+    const result = await namespace.getPullRequestFileDiff({ ...pullRequestReference, iterationId: 3, changeTrackingId: 2 });
+    assert.match(result.unavailable, /too large/);
+});
+
+test("PR changes routes require nonce and reject unconfigured organizations", async () => {
+    const { namespace } = await loadWithAzureDevOps({ diffFixture: prDiffFixture() });
+    const canvas = await startCanvas(namespace);
+    try {
+        await namespace.setConnection({}, { organization: "fabrikam", project: "project" });
+        await waitForAuthProcess(canvas);
+        const path = `${canvas.base}/api/pull-requests/42/changes`;
+        assert.equal((await (await fetch(path)).json()).error, "azure_devops_invalid_nonce");
+        const headers = { "x-canvas-nonce": canvas.apiNonce };
+        const response = await fetch(`${path}?organization=fabrikam&project=project`, { headers });
+        const result = await response.json();
+        assert.equal(response.status, 200, JSON.stringify(result));
+        assert.equal(result.files.length, 5);
+        const diff = await fetch(`${path}/1?organization=fabrikam&project=project&iterationId=3`, { headers });
+        assert.equal((await diff.json()).additions, 1);
+        const denied = await fetch(`${path}?organization=unconfigured`, { headers });
+        assert.notEqual(denied.status, 200);
+    } finally { canvas.close(); }
+});
 
 test("a review vote is written against the signed-in identity", {
     skip: PULL_REQUEST_REVIEW_VOTING_ENABLED ? false : "review voting is feature-flagged off",
