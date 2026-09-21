@@ -4,6 +4,7 @@ import { renderLinkedWorkItems, renderPullRequestActions, renderReviewers } from
 import { renderPullRequestChecks } from "./pull-request-checks.mjs";
 import { createEditActions, createMarkdownField, createPlainField, editButton } from "./editor.mjs";
 import { richTextElement } from "./rich-text.mjs";
+import { createPullRequestFiles } from "./pull-request-files.mjs";
 
 function element(tagName, className, text) {
     const node = document.createElement(tagName);
@@ -618,6 +619,28 @@ export function renderPullRequest(container, pr, options) {
         body.append(mainColumn);
     }
     summary.append(body);
+
+    if (!options.editMode && options.loadChanges && options.loadFileDiff) {
+        const files = createPullRequestFiles(pr, options);
+        files.host.hidden = true;
+        const navigation = element("div", "pr-files-tabs");
+        navigation.setAttribute("role", "group");
+        navigation.setAttribute("aria-label", "Pull request view");
+        for (const [label, showFiles] of [["Overview", false], ["Files changed", true]]) {
+            const control = element("button", "secondary", label);
+            control.type = "button";
+            control.setAttribute("aria-pressed", String(!showFiles));
+            control.addEventListener("click", () => {
+                body.hidden = showFiles;
+                files.host.hidden = !showFiles;
+                for (const button of navigation.children) button.setAttribute("aria-pressed", String(button === control));
+                if (showFiles) files.load();
+            });
+            navigation.append(control);
+        }
+        body.before(navigation);
+        summary.append(files.host);
+    }
 
     const entries = timelineEntries(pr);
     const threads = entries.filter((entry) => entry.kind === "thread");

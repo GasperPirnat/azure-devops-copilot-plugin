@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { PULL_REQUEST_REVIEW_VOTING_ENABLED } from "./ui/feature-flags.mjs";
+import { AGENCY_AUTH_ENABLED, PULL_REQUEST_REVIEW_VOTING_ENABLED } from "./ui/feature-flags.mjs";
 import { workItemTypeColor } from "./ui/pull-request-actions.mjs";
 
 // These extensions ship without node_modules, so jsdom is not guaranteed to be
@@ -186,6 +186,14 @@ function makeFetch(state) {
             Object.assign(state, state.afterAction || {});
             return json({ pullRequest: makePullRequest(state, Number(prThreadAction[1])) });
         }
+        const prChanges = path.match(/\/api\/pull-requests\/(\d+)\/changes(?:\/(\d+))?/);
+        if (prChanges) {
+            state.diffRequests = [...(state.diffRequests || []), { path, nonce: new Headers(options.headers).get("X-Canvas-Nonce") }];
+            return json(prChanges[2] ? { additions: 1, deletions: 0, rows: [{ type: "addition", sourceLineNumber: 1, text: "new" }] } : {
+                iterationId: 7, baseCommit: "base1234", sourceCommit: "source1234",
+                files: [{ changeTrackingId: 9, path: "/file.txt", originalPath: "/file.txt", changeType: "add" }],
+            });
+        }
         const prAction = path.match(/\/api\/pull-requests\/(\d+)\/([a-z-]+(?:\/[a-z-]+)?)/);
         if (prAction) {
             state.prActions = [...(state.prActions || []), {
@@ -331,6 +339,30 @@ async function closeTab(w, index) {
     await settle();
 }
 
+test("Files changed loads the PR snapshot with its connection and preserves Overview", describeDom, async () => {
+    const { window, state } = await boot({ pullRequestReference: true, leadPr: { id: 42, title: "Referenced" } });
+    const panel = visiblePanels(window)[0];
+    const controls = [...panel.querySelectorAll(".pr-files-tabs button")];
+    assert.equal(controls.length, 2);
+    assert.equal(state.diffRequests, undefined);
+    controls[1].click();
+    await settle();
+    assert.equal(panel.querySelector(".pr-body").hidden, true);
+    assert.equal(panel.querySelector(".pr-files").hidden, false);
+    panel.querySelector(".pr-file").open = true;
+    await settle();
+    assert.equal(state.diffRequests.length, 2);
+    assert.equal(state.diffRequests[0].nonce, "n");
+    assert.match(state.diffRequests[0].path, /organization=example&project=project/);
+    assert.match(state.diffRequests[1].path, /changes\/9\?.*iterationId=7/);
+    controls[0].click();
+    assert.equal(panel.querySelector(".pr-body").hidden, false);
+    controls[1].click();
+    await settle();
+    assert.equal(state.diffRequests.length, 2);
+    window.close();
+});
+
 test("startup paints a smooth loading spinner before configuration resolves", describeDom, async () => {
     const config = deferred();
     const { window } = await boot({ holdConfig: config.promise });
@@ -405,7 +437,7 @@ test("failed silent AzureAuth ends at the sign-in chooser", describeDom, async (
     assert.equal(window.document.getElementById("startupSplash").hidden, true);
     assert.equal(window.document.getElementById("signInSplash").hidden, false);
     assert.equal(window.document.getElementById("canvasContent").hidden, true);
-    assert.equal(window.document.getElementById("signInAgencyButton").hidden, false);
+    assert.equal(window.document.getElementById("signInAgencyButton").hidden, !AGENCY_AUTH_ENABLED);
     assert.equal(
         window.document.getElementById("signInAgencyButton").textContent,
         "Agency (AzureAuth)",
